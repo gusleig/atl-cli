@@ -1,0 +1,883 @@
+#!/usr/bin/env python3
+"""Atlassian CLI for Jira and Confluence Cloud. Reads freely. Writes only after a preview and --yes.
+
+Usage:
+  atl auth login | status | logout
+  atl auth set-token jira|confluence|jira-write|confluence-write
+
+  Jira, read:
+  atl jira get KEY [--fields a,b] [--comments] [--json]
+  atl jira search JQL [--fields a,b] [--max N] [--json]
+  atl jira find TEXT [--project P] [--open] [--max N]   Text search. Builds and prints the JQL.
+  atl jira comments KEY [--json]
+  atl jira transitions KEY
+  atl jira editmeta KEY                 Editable fields of an issue, with ids and allowed values.
+  atl jira user QUERY                   Find account ids, for --assignee and @[Name](accountid:ID) mentions.
+
+  Jira, write (dry run without --yes):
+  atl jira edit KEY [--summary S] [--description-file F.md] [--points N] [--priority NAME]
+                    [--labels a,b] [--assignee ACCOUNT_ID|me|none] [--sprint ID] [--parent KEY]
+                    [--set FIELD=JSON ...] [--yes]
+  atl jira comment KEY --file F.md [--yes]
+  atl jira edit-comment KEY COMMENT_ID --file F.md [--yes]
+  atl jira transition KEY TRANSITION_ID_OR_NAME [--yes]
+  atl jira create --project P --type T --summary S [--description-file F.md] [--parent KEY]
+                  [--points N] [--labels a,b] [--yes]
+
+  Confluence:
+  atl confluence get PAGE_ID_OR_URL [--json]
+  atl confluence search CQL [--max N] [--json]
+  atl confluence find TEXT [--space KEY] [--max N]      Title and text search. Builds and prints the CQL.
+  atl confluence update PAGE --file F.html --base-version N [--title T] [--message M] [--yes]
+  atl confluence comment PAGE --file F.html [--yes]
+
+Markdown files become Atlassian Document Format: headings, paragraphs, lists (nested), tables,
+code blocks, quotes, rules, **bold**, *italic*, `code`, [links](url) and @[Name](accountid:ID) mentions.
+Confluence bodies are storage-format HTML.
+
+Reads use the read tokens. Writes use separate write tokens. Every write prints what it will send
+and sends nothing without --yes. Create tokens at https://id.atlassian.com/manage-profile/security/api-tokens.
+"""
+import argparse
+import base64
+import difflib
+import getpass
+import html
+import html.parser
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONFIG_PATH = os.path.expanduser("~/.config/atl/config.json")
+KEYCHAIN_SERVICE = "atl-cli"  # classic token, for Jira and Confluence
+# A scoped token covers one app, so each app has its own Keychain item. Writes use their own tokens.
+SCOPED_SERVICES = {"jira": "atl-cli-jira", "confluence": "atl-cli-confluence",
+                   "jira-write": "atl-cli-jira-write", "confluence-write": "atl-cli-confluence-write"}
+# Some corporate TLS proxies use a root CA with no key usage extension, which Python 3.13+ rejects
+# in strict X.509 mode. Drop only that flag. Certificate and hostname checks stay on.
+SSL_CONTEXT = ssl.create_default_context()
+SSL_CONTEXT.verify_flags &= ~ssl.VERIFY_X509_STRICT
+# POST endpoints that only read. They use the read token.
+READ_ONLY_POSTS = {"/rest/api/3/search/jql"}
+# Story Points and Sprint are custom fields. Their ids differ per site, so the config can override
+# these defaults with "points_field" and "sprint_field". atl jira editmeta KEY shows the ids.
+POINTS_FIELD, SPRINT_FIELD = "customfield_10014", "customfield_10010"
+BASE_FIELDS = ["summary", "status", "assignee", "reporter", "priority", "issuetype",
+               "parent", "labels", "created", "updated", "description", "issuelinks"]
+CHECK_PATHS = {"jira": ("/rest/api/3/myself", {}), "confluence": ("/wiki/api/v2/spaces", {"limit": 1})}
+
+
+# --- config and keychain ------------------------------------------------------
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        sys.exit("Not logged in. Run: atl auth login")
+
+
+def set_custom_fields(cfg):
+    global POINTS_FIELD, SPRINT_FIELD, DEFAULT_FIELDS, FIELD_LABELS
+    POINTS_FIELD = cfg.get("points_field", POINTS_FIELD)
+    SPRINT_FIELD = cfg.get("sprint_field", SPRINT_FIELD)
+    DEFAULT_FIELDS = BASE_FIELDS + [POINTS_FIELD, SPRINT_FIELD]
+    FIELD_LABELS = {POINTS_FIELD: "Story Points", SPRINT_FIELD: "Sprint"}
+
+
+def keychain_get(service, email):
+    r = subprocess.run(["security", "find-generic-password", "-s", service, "-a", email, "-w"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def keychain_token(email, product):
+    """product is jira, confluence, jira-write or confluence-write."""
+    token = keychain_get(SCOPED_SERVICES[product], email) or keychain_get(KEYCHAIN_SERVICE, email)
+    if not token:
+        sys.exit(f"No {product} token in the Keychain. Run: atl auth set-token {product}")
+    return token
+
+
+def keychain_store(service, email, token):
+    # security -i reads the command from stdin, so the token is not on any command line.
+    cmd = f'add-generic-password -U -s {service} -a {email} -w "{token}"\n'
+    r = subprocess.run(["security", "-i"], input=cmd, capture_output=True, text=True)
+    if r.returncode != 0 or keychain_get(service, email) != token:
+        sys.exit("Could not save the token in the Keychain.")
+
+
+def keychain_delete_all(email):
+    for service in [KEYCHAIN_SERVICE, *SCOPED_SERVICES.values()]:
+        subprocess.run(["security", "delete-generic-password", "-s", service, "-a", email], capture_output=True)
+
+
+# --- http client --------------------------------------------------------------
+
+class Client:
+    def __init__(self, site, email, cloud_id=None):
+        self.base = "https://" + site.removeprefix("https://").rstrip("/")
+        self.email = email
+        self.cloud_id = cloud_id  # set for scoped tokens, which work only through the api.atlassian.com gateway
+
+    def auth_for(self, path, write=False):
+        product = ("confluence" if path.startswith("/wiki/") else "jira") + ("-write" if write else "")
+        token = keychain_token(self.email, product)
+        return "Basic " + base64.b64encode(f"{self.email}:{token}".encode()).decode()
+
+    def url_for(self, path):
+        if not self.cloud_id:
+            return self.base + path
+        app = "confluence" if path.startswith("/wiki/") else "jira"
+        return f"https://api.atlassian.com/ex/{app}/{self.cloud_id}" + path
+
+    def request(self, method, path, params=None, body=None, write=False):
+        reads = method == "GET" or (method == "POST" and path in READ_ONLY_POSTS)
+        if not reads and not write:
+            raise RuntimeError(f"Blocked {method} {path}: writes must go through a confirmed write command.")
+        url = self.url_for(path) + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method, headers={
+            "Authorization": self.auth_for(path, write=not reads), "Accept": "application/json",
+            "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=60, context=SSL_CONTEXT) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:800]
+            sys.exit(f"HTTP {e.code} on {method} {path}: {detail}")
+        except urllib.error.URLError as e:
+            sys.exit(f"Connection failed on {method} {path}: {e.reason}")
+
+    def get(self, path, **params):
+        return self.request("GET", path, params or None)
+
+    def write(self, method, path, body=None, params=None):
+        return self.request(method, path, params=params, body=body, write=True)
+
+
+def client():
+    cfg = load_config()
+    set_custom_fields(cfg)
+    return Client(cfg["site"], cfg["email"], cfg.get("cloud_id"))
+
+
+def lookup_cloud_id(site):
+    url = "https://" + site.removeprefix("https://").rstrip("/") + "/_edge/tenant_info"
+    with urllib.request.urlopen(url, timeout=30, context=SSL_CONTEXT) as resp:
+        return json.load(resp)["cloudId"]
+
+
+# --- ADF to text --------------------------------------------------------------
+
+def adf_to_text(node, depth=0):
+    """Render Atlassian Document Format as markdown-like text."""
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    t = node.get("type")
+    kids = node.get("content", [])
+    inner = "".join(adf_to_text(k, depth) for k in kids)
+    if t == "text":
+        text = node.get("text", "")
+        for m in node.get("marks", []):
+            if m["type"] == "link":
+                text = f"[{text}]({m['attrs'].get('href', '')})"
+            elif m["type"] == "code":
+                text = f"`{text}`"
+            elif m["type"] == "strong":
+                text = f"**{text}**"
+            elif m["type"] == "em":
+                text = f"*{text}*"
+        return text
+    if t == "hardBreak":
+        return "\n"
+    if t == "mention":
+        a = node.get("attrs", {})
+        return f"@[{a.get('text', 'user').lstrip('@')}](accountid:{a.get('id', '')})"
+    if t in ("inlineCard", "blockCard"):
+        return node.get("attrs", {}).get("url", "")
+    if t == "emoji":
+        return node.get("attrs", {}).get("text", "")
+    if t == "paragraph":
+        return inner + "\n\n"
+    if t == "heading":
+        return "#" * node.get("attrs", {}).get("level", 2) + " " + inner + "\n\n"
+    if t in ("bulletList", "orderedList"):
+        out = []
+        for i, item in enumerate(kids, 1):
+            mark = f"{i}." if t == "orderedList" else "-"
+            body = "".join(adf_to_text(k, depth + 1) for k in item.get("content", [])).strip()
+            out.append("  " * depth + f"{mark} {body}")
+        return "\n".join(out) + "\n\n"
+    if t == "codeBlock":
+        return "```\n" + inner + "\n```\n\n"
+    if t == "blockquote":
+        return "".join("> " + line + "\n" for line in inner.strip().split("\n")) + "\n"
+    if t == "rule":
+        return "---\n\n"
+    if t == "table":
+        rows = []
+        for n, row in enumerate(kids):
+            cells = [" ".join(adf_to_text(c).split()) for c in row.get("content", [])]
+            rows.append("| " + " | ".join(cells) + " |")
+            if n == 0 and row.get("content") and row["content"][0].get("type") == "tableHeader":
+                rows.append("|" + "---|" * len(cells))
+        return "\n".join(rows) + "\n\n"
+    return inner
+
+
+# --- markdown to ADF ----------------------------------------------------------
+
+INLINE = re.compile(
+    r"(?P<code>`[^`]+`)"
+    r"|(?P<mention>@\[(?P<mname>[^\]]+)\]\(accountid:(?P<mid>[^)\s]+)\))"
+    r"|(?P<link>\[(?P<ltext>[^\]]+)\]\((?P<lurl>[^)\s]+)\))"
+    r"|(?P<bold>\*\*(?P<btext>.+?)\*\*)"
+    r"|(?P<em>(?<![\w*])\*(?P<etext>[^*\s][^*]*?)\*(?![\w*]))")
+
+
+def _with_mark(nodes, mark):
+    for n in nodes:
+        if n["type"] == "text":
+            n.setdefault("marks", []).append(mark)
+    return nodes
+
+
+def md_inline(text):
+    nodes, pos = [], 0
+    for m in INLINE.finditer(text):
+        if m.start() > pos:
+            nodes.append({"type": "text", "text": text[pos:m.start()]})
+        if m.group("code"):
+            nodes.append({"type": "text", "text": m.group("code")[1:-1], "marks": [{"type": "code"}]})
+        elif m.group("mention"):
+            nodes.append({"type": "mention", "attrs": {"id": m.group("mid"), "text": "@" + m.group("mname")}})
+        elif m.group("link"):
+            nodes += _with_mark(md_inline(m.group("ltext")), {"type": "link", "attrs": {"href": m.group("lurl")}})
+        elif m.group("bold"):
+            nodes += _with_mark(md_inline(m.group("btext")), {"type": "strong"})
+        elif m.group("em"):
+            nodes += _with_mark(md_inline(m.group("etext")), {"type": "em"})
+        pos = m.end()
+    if pos < len(text):
+        nodes.append({"type": "text", "text": text[pos:]})
+    return [n for n in nodes if n["type"] != "text" or n["text"]]
+
+
+def _para(text):
+    content = md_inline(text.strip())
+    return {"type": "paragraph", "content": content} if content else {"type": "paragraph"}
+
+
+LIST_ITEM = re.compile(r"^(?P<indent>\s*)(?P<marker>[-*+]|\d+[.)])\s+(?P<text>.*)$")
+
+
+def _parse_list(lines, i, indent):
+    """Parse list items at one indent level. Returns (node, next line index)."""
+    first = LIST_ITEM.match(lines[i])
+    ordered = first.group("marker")[0].isdigit()
+    node = {"type": "orderedList" if ordered else "bulletList", "content": []}
+    while i < len(lines):
+        m = LIST_ITEM.match(lines[i])
+        if not m:
+            break
+        ind = len(m.group("indent").expandtabs(2))
+        if ind < indent:
+            break
+        if ind > indent:  # nested list belongs to the previous item
+            sub, i = _parse_list(lines, i, ind)
+            node["content"][-1]["content"].append(sub)
+            continue
+        if m.group("marker")[0].isdigit() != ordered:
+            break
+        text = m.group("text")
+        i += 1
+        while i < len(lines) and lines[i].strip() and not LIST_ITEM.match(lines[i]) \
+                and len(lines[i]) - len(lines[i].lstrip()) > indent:
+            text += " " + lines[i].strip()  # wrapped continuation line
+            i += 1
+        node["content"].append({"type": "listItem", "content": [_para(text)]})
+    return node, i
+
+
+def _table(rows):
+    def cells(line):
+        return [c.strip() for c in line.strip().strip("|").split("|")]
+    has_header = len(rows) > 1 and re.fullmatch(r"\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?", rows[1].strip())
+    body = rows[2:] if has_header else rows
+    out = []
+    if has_header:
+        out.append({"type": "tableRow", "content": [
+            {"type": "tableHeader", "content": [_para(c)]} for c in cells(rows[0])]})
+    for r in body:
+        out.append({"type": "tableRow", "content": [{"type": "tableCell", "content": [_para(c)]} for c in cells(r)]})
+    return {"type": "table", "attrs": {"isNumberColumnEnabled": False, "layout": "default"}, "content": out}
+
+
+def md_to_adf(md):
+    lines = md.replace("\r\n", "\n").split("\n")
+    blocks, i, para = [], 0, []
+
+    def flush():
+        if para:
+            blocks.append(_para(" ".join(para)))
+            para.clear()
+
+    while i < len(lines):
+        line = lines[i]
+        s = line.strip()
+        if not s:
+            flush()
+            i += 1
+        elif s.startswith("```"):
+            flush()
+            lang = s[3:].strip()
+            code = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                code.append(lines[i])
+                i += 1
+            i += 1
+            node = {"type": "codeBlock", "content": [{"type": "text", "text": "\n".join(code)}]}
+            if lang:
+                node["attrs"] = {"language": lang}
+            blocks.append(node)
+        elif re.match(r"^#{1,6}\s", s):
+            flush()
+            level = len(s) - len(s.lstrip("#"))
+            blocks.append({"type": "heading", "attrs": {"level": level}, "content": md_inline(s[level:].strip())})
+            i += 1
+        elif re.fullmatch(r"(-{3,}|\*{3,})", s):
+            flush()
+            blocks.append({"type": "rule"})
+            i += 1
+        elif s.startswith("|"):
+            flush()
+            rows = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                rows.append(lines[i])
+                i += 1
+            blocks.append(_table(rows))
+        elif s.startswith(">"):
+            flush()
+            quote = []
+            while i < len(lines) and lines[i].strip().startswith(">"):
+                quote.append(lines[i].strip()[1:].lstrip())
+                i += 1
+            blocks.append({"type": "blockquote", "content": md_to_adf("\n".join(quote))["content"]})
+        elif LIST_ITEM.match(line):
+            flush()
+            node, i = _parse_list(lines, i, len(LIST_ITEM.match(line).group("indent").expandtabs(2)))
+            blocks.append(node)
+        else:
+            para.append(s)
+            i += 1
+    flush()
+    return {"type": "doc", "version": 1, "content": blocks}
+
+
+# --- HTML to text -------------------------------------------------------------
+
+class _HTMLText(html.parser.HTMLParser):
+    BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "table", "ul", "ol"}
+
+    def __init__(self):
+        super().__init__()
+        self.out, self.href = [], None
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.BLOCK:
+            self.out.append("\n")
+        if tag == "li":
+            self.out.append("- ")
+        if tag in ("td", "th"):
+            self.out.append(" | ")
+        if re.fullmatch(r"h[1-6]", tag):
+            self.out.append("#" * int(tag[1]) + " ")
+        if tag == "a":
+            self.href = dict(attrs).get("href")
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self.href:
+            self.out.append(f" ({self.href})")
+            self.href = None
+
+    def handle_data(self, data):
+        self.out.append(data)
+
+
+def html_to_text(s):
+    p = _HTMLText()
+    p.feed(s or "")
+    return re.sub(r"\n{3,}", "\n\n", "".join(p.out)).strip()
+
+
+def field_text(name, value):
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        if value.get("type") == "doc":
+            return adf_to_text(value).strip()
+        for k in ("displayName", "name", "value", "key"):
+            if k in value:
+                extra = f" ({value['fields']['summary']})" if k == "key" and "fields" in value else ""
+                return str(value[k]) + extra
+        return json.dumps(value)
+    if isinstance(value, list):
+        if name == "issuelinks":
+            out = []
+            for link in value:
+                if "outwardIssue" in link:
+                    out.append(f"{link['type']['outward']} {link['outwardIssue']['key']}")
+                if "inwardIssue" in link:
+                    out.append(f"{link['type']['inward']} {link['inwardIssue']['key']}")
+            return "; ".join(out)
+        if value and isinstance(value[0], dict) and "state" in value[0]:  # sprints
+            return "; ".join(f"{s['name']} ({s['state']}, id {s['id']})" for s in value)
+        return ", ".join(field_text(name, v) for v in value)
+    return str(value)
+
+
+# --- write preview ------------------------------------------------------------
+
+def show_diff(label, old, new):
+    diff = list(difflib.unified_diff(old.strip().splitlines(), new.strip().splitlines(),
+                                     "current", "new", lineterm="", n=2))
+    print(f"{label}:")
+    print("\n".join(diff) if diff else "  (no change)")
+
+
+def confirm(args, what):
+    if not args.yes:
+        print(f"\nDry run. Nothing was sent. Add --yes to {what}.")
+        return False
+    return True
+
+
+def read_file(path):
+    with open(path) as f:
+        return f.read()
+
+
+# --- auth commands ------------------------------------------------------------
+
+def ask_token(product):
+    """Ask for a token and check its shape before it goes to the Keychain."""
+    while True:
+        token = getpass.getpass(f"Paste the {product} API token (starts with ATATT, the input stays hidden): ").strip()
+        if not token:
+            if input("No token entered. Skip it? [y/N]: ").strip().lower() == "y":
+                return None
+            continue
+        if not token.startswith("ATATT") or len(token) < 100:
+            print(f"That is not an API token ({len(token)} characters). Copy the full token from id.atlassian.com.")
+            continue
+        return token
+
+
+def test_token(cfg, product, token):
+    path, params = CHECK_PATHS[product.removesuffix("-write")]
+    c = Client(cfg["site"], cfg["email"], cfg.get("cloud_id"))
+    c.auth_for = lambda _path, write=False: "Basic " + base64.b64encode(f"{cfg['email']}:{token}".encode()).decode()
+    try:
+        c.get(path, **params)
+        return True
+    except SystemExit as e:
+        print(f"The check with the {product} token failed: {e}")
+        return False
+
+
+def add_token(cfg, product, service):
+    while True:
+        token = ask_token(product)
+        if token is None:
+            return
+        ok = test_token(cfg, product, token)
+        if not ok and product.endswith("-write"):
+            # A write-only token cannot read, so the check can fail for a good token.
+            ok = input("A write token without read scopes fails this check. Save it anyway? [y/N]: ").strip().lower() == "y"
+        if ok:
+            keychain_store(service, cfg["email"], token)
+            print(f"Saved the {product} token in the Keychain.")
+            return
+        if input("Try another token? [Y/n]: ").strip().lower() == "n":
+            return
+
+
+def cmd_auth(args):
+    if args.action == "login":
+        site = input("Atlassian site (for example your-company.atlassian.net): ").strip()
+        email = input("Email: ").strip()
+        scoped = input("Scoped tokens (created with 'Create API token with scopes')? [y/N]: ").strip().lower() == "y"
+        cfg = {"site": site, "email": email}
+        if scoped:
+            cfg["cloud_id"] = lookup_cloud_id(site)
+        os.makedirs(os.path.dirname(CONFIG_PATH), mode=0o700, exist_ok=True)
+        fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(cfg, f)
+        keychain_delete_all(email)  # drop old tokens, so a stale one is never used as a fallback
+        if not scoped:
+            add_token(cfg, "jira", KEYCHAIN_SERVICE)
+        else:
+            for product in ("jira", "confluence"):
+                add_token(cfg, product, SCOPED_SERVICES[product])
+            print("Add write tokens later with: atl auth set-token jira-write | confluence-write")
+        args.action = "status"
+    if args.action == "set-token":
+        cfg = load_config()
+        if args.app not in SCOPED_SERVICES:
+            sys.exit("Usage: atl auth set-token jira|confluence|jira-write|confluence-write")
+        add_token(cfg, args.app, SCOPED_SERVICES[args.app] if cfg.get("cloud_id") else KEYCHAIN_SERVICE)
+        args.action = "status"
+    if args.action == "status":
+        cfg = load_config()
+        c = client()
+        print(f"Site {cfg['site']}, {'scoped tokens' if cfg.get('cloud_id') else 'classic token'}.")
+        for product, (path, params) in CHECK_PATHS.items():
+            if not (keychain_get(SCOPED_SERVICES[product], cfg["email"]) or keychain_get(KEYCHAIN_SERVICE, cfg["email"])):
+                print(f"{product}: no token")
+                continue
+            try:
+                data = c.get(path, **params)
+                print(f"{product}: ok" + (f", logged in as {data.get('displayName')}" if product == "jira" else ""))
+            except SystemExit as e:
+                print(f"{product}: failed, {e}")
+        for product in ("jira-write", "confluence-write"):
+            saved = keychain_get(SCOPED_SERVICES[product], cfg["email"]) or keychain_get(KEYCHAIN_SERVICE, cfg["email"])
+            print(f"{product}: {'token saved (tested on the first write)' if saved else 'no token'}")
+    elif args.action == "logout":
+        cfg = load_config()
+        keychain_delete_all(cfg["email"])
+        os.remove(CONFIG_PATH)
+        print("Removed the config and the Keychain items. Revoke the tokens at id.atlassian.com too.")
+
+
+# --- jira commands ------------------------------------------------------------
+
+def print_issue(issue, fields):
+    f = issue["fields"]
+    print(f"{issue['key']}: {f.get('summary', '')}")
+    print(f"https://{load_config()['site']}/browse/{issue['key']}")
+    for name in fields:
+        if name in ("summary", "description") or name not in f:
+            continue
+        print(f"{FIELD_LABELS.get(name, name)}: {field_text(name, f[name])}")
+    if "description" in fields and f.get("description"):
+        print("\nDescription:\n" + field_text("description", f["description"]))
+
+
+def print_comments(c, key, as_json):
+    data = c.get(f"/rest/api/3/issue/{key}/comment", maxResults=100, orderBy="created")
+    if as_json:
+        print(json.dumps(data, indent=2))
+        return
+    for cm in data.get("comments", []):
+        print(f"\n--- {cm['author']['displayName']} {cm['created']} (id {cm['id']})")
+        print(adf_to_text(cm.get("body")).strip())
+
+
+def build_fields(args, c):
+    """Turn edit and create options into a Jira fields payload."""
+    fields = {}
+    if args.summary is not None:
+        fields["summary"] = args.summary
+    if args.description_file:
+        fields["description"] = md_to_adf(read_file(args.description_file))
+    if args.points is not None:
+        fields[POINTS_FIELD] = args.points
+    if getattr(args, "priority", None):
+        fields["priority"] = {"name": args.priority}
+    if args.labels is not None:
+        fields["labels"] = [l.strip() for l in args.labels.split(",") if l.strip()]
+    if getattr(args, "assignee", None):
+        if args.assignee == "none":
+            fields["assignee"] = None
+        else:
+            acct = c.get("/rest/api/3/myself")["accountId"] if args.assignee == "me" else args.assignee
+            fields["assignee"] = {"accountId": acct}
+    if getattr(args, "sprint", None) is not None:
+        fields[SPRINT_FIELD] = args.sprint
+    if args.parent:
+        fields["parent"] = {"key": args.parent}
+    for item in getattr(args, "set", None) or []:
+        name, _, raw = item.partition("=")
+        try:
+            fields[name] = json.loads(raw)
+        except json.JSONDecodeError:
+            fields[name] = raw
+    return fields
+
+
+def preview_value(name, value):
+    if isinstance(value, dict) and value.get("type") == "doc":
+        return adf_to_text(value)
+    return field_text(name, value) if not isinstance(value, (int, float, str)) else str(value)
+
+
+def jira_edit(c, args):
+    fields = build_fields(args, c)
+    if not fields:
+        sys.exit("Nothing to change. Pass at least one field option.")
+    current = c.get(f"/rest/api/3/issue/{args.key}", fields=",".join(fields))["fields"]
+    print(f"Edit {args.key}:")
+    for name, value in fields.items():
+        label = FIELD_LABELS.get(name, name)
+        if name == "description":
+            show_diff(label, preview_value(name, current.get(name)), preview_value(name, value))
+        else:
+            print(f"{label}: {preview_value(name, current.get(name))!r} -> {preview_value(name, value)!r}")
+    if confirm(args, "update the issue"):
+        c.write("PUT", f"/rest/api/3/issue/{args.key}", body={"fields": fields})
+        print(f"Updated {args.key}.")
+
+
+def jira_comment(c, args):
+    body = md_to_adf(read_file(args.file))
+    print(f"New comment on {args.key}:\n")
+    print(adf_to_text(body).strip())
+    if confirm(args, "post the comment"):
+        r = c.write("POST", f"/rest/api/3/issue/{args.key}/comment", body={"body": body})
+        print(f"Posted comment {r.get('id')}: https://{load_config()['site']}/browse/{args.key}?focusedCommentId={r.get('id')}")
+
+
+def jira_edit_comment(c, args):
+    old = c.get(f"/rest/api/3/issue/{args.key}/comment/{args.comment_id}")
+    body = md_to_adf(read_file(args.file))
+    print(f"Edit comment {args.comment_id} on {args.key} (author {old['author']['displayName']}):")
+    show_diff("Comment", adf_to_text(old.get("body")), adf_to_text(body))
+    if confirm(args, "update the comment"):
+        c.write("PUT", f"/rest/api/3/issue/{args.key}/comment/{args.comment_id}", body={"body": body})
+        print("Updated the comment.")
+
+
+def jira_transition(c, args):
+    issue = c.get(f"/rest/api/3/issue/{args.key}", fields="status")
+    options = c.get(f"/rest/api/3/issue/{args.key}/transitions")["transitions"]
+    match = [t for t in options if t["id"] == args.transition or t["name"].lower() == args.transition.lower()]
+    if not match:
+        sys.exit("No such transition. Options: " + ", ".join(f"{t['id']} {t['name']} -> {t['to']['name']}" for t in options))
+    t = match[0]
+    print(f"Transition {args.key}: {issue['fields']['status']['name']} -> {t['to']['name']} (transition {t['id']} {t['name']})")
+    if confirm(args, "move the issue"):
+        c.write("POST", f"/rest/api/3/issue/{args.key}/transitions", body={"transition": {"id": t["id"]}})
+        print(f"Moved {args.key} to {t['to']['name']}.")
+
+
+def jira_create(c, args):
+    fields = build_fields(args, c)
+    fields["project"] = {"key": args.project}
+    fields["issuetype"] = {"name": args.type}
+    print(f"Create a {args.type} in {args.project}:")
+    for name, value in fields.items():
+        if name in ("project", "issuetype"):
+            continue
+        text = preview_value(name, value)
+        print(f"{FIELD_LABELS.get(name, name)}:" + ("\n" + text if "\n" in text else f" {text}"))
+    if confirm(args, "create the issue"):
+        r = c.write("POST", "/rest/api/3/issue", body={"fields": fields})
+        print(f"Created {r.get('key')}: https://{load_config()['site']}/browse/{r.get('key')}")
+
+
+def cmd_jira(args):
+    c = client()
+    a = args.action
+    if a == "get":
+        fields = args.fields.split(",") if args.fields else DEFAULT_FIELDS
+        issue = c.get(f"/rest/api/3/issue/{args.key}", fields=",".join(fields))
+        if args.json:
+            print(json.dumps(issue, indent=2))
+        else:
+            print_issue(issue, fields)
+        if args.comments:
+            print_comments(c, args.key, args.json)
+    elif a == "comments":
+        print_comments(c, args.key, args.json)
+    elif a in ("search", "find"):
+        if a == "find":
+            q = args.text.replace('"', '\\"')
+            jql = [f'text ~ "{q}"']
+            project = args.project or load_config().get("default_project")
+            if project:
+                jql.insert(0, f'project = "{project}"')
+            if args.open:
+                jql.append("statusCategory != Done")
+            args.jql = " AND ".join(jql) + " ORDER BY updated DESC"
+            print(f"JQL: {args.jql}")
+        fields = args.fields.split(",") if args.fields else DEFAULT_FIELDS
+        issues, token = [], None
+        while len(issues) < args.max:
+            body = {"jql": args.jql, "fields": fields, "maxResults": min(100, args.max - len(issues))}
+            if token:
+                body["nextPageToken"] = token
+            page = c.request("POST", "/rest/api/3/search/jql", body=body)
+            issues += page.get("issues", [])
+            token = page.get("nextPageToken")
+            if not token or page.get("isLast", True):
+                break
+        if args.json:
+            print(json.dumps(issues, indent=2))
+            return
+        for i in issues:
+            f = i["fields"]
+            cols = [i["key"], field_text("status", f.get("status"))]
+            if a == "find":
+                cols.append(field_text("assignee", f.get("assignee")) or "unassigned")
+            if a == "search":
+                cols += [field_text(n, f.get(n)) for n in fields if n not in ("summary", "status", "description")]
+            print(" | ".join(cols + [f.get("summary", "")]))
+    elif a == "transitions":
+        for t in c.get(f"/rest/api/3/issue/{args.key}/transitions")["transitions"]:
+            print(f"{t['id']} | {t['name']} -> {t['to']['name']}")
+    elif a == "editmeta":
+        meta = c.get(f"/rest/api/3/issue/{args.key}/editmeta")["fields"]
+        for fid, m in sorted(meta.items(), key=lambda kv: kv[1].get("name", "")):
+            allowed = ", ".join(v.get("name") or v.get("value") or str(v.get("id")) for v in m.get("allowedValues", [])[:15])
+            print(f"{fid} | {m.get('name')} | {m.get('schema', {}).get('type')}" + (f" | {allowed}" if allowed else ""))
+    elif a == "user":
+        for u in c.get("/rest/api/3/user/search", query=args.query, maxResults=20):
+            print(f"{u['accountId']} | {u.get('displayName')} | {'active' if u.get('active') else 'inactive'}")
+    elif a == "edit":
+        jira_edit(c, args)
+    elif a == "comment":
+        jira_comment(c, args)
+    elif a == "edit-comment":
+        jira_edit_comment(c, args)
+    elif a == "transition":
+        jira_transition(c, args)
+    elif a == "create":
+        jira_create(c, args)
+
+
+# --- confluence commands ------------------------------------------------------
+
+def page_id(target):
+    m = re.search(r"/pages/(\d+)", target)
+    return m.group(1) if m else target
+
+
+def cmd_confluence(args):
+    c = client()
+    a = args.action
+    if a == "get":
+        page = c.get(f"/wiki/api/v2/pages/{page_id(args.page)}", **{"body-format": "storage"})
+        if args.json:
+            print(json.dumps(page, indent=2))
+            return
+        print(f"{page['title']} (id {page['id']}, version {page['version']['number']}, "
+              f"updated {page['version']['createdAt']})")
+        print(html_to_text(page["body"]["storage"]["value"]))
+    elif a in ("search", "find"):
+        if a == "find":
+            q = args.text.replace('"', '\\"')
+            cql = f'type = page AND (title ~ "{q}" OR text ~ "{q}")'
+            if args.space:
+                cql += f' AND space = "{args.space}"'
+            args.cql = cql + " ORDER BY lastmodified DESC"
+            print(f"CQL: {args.cql}")
+        data = c.get("/wiki/rest/api/search", cql=args.cql, limit=args.max)
+        if args.json:
+            print(json.dumps(data, indent=2))
+            return
+        for r in data.get("results", []):
+            content = r.get("content", {})
+            space = r.get("resultGlobalContainer", {}).get("title", "")
+            url = f"https://{load_config()['site']}/wiki" + r.get("url", "") if r.get("url") else ""
+            print(f"{content.get('id', '')} | {html.unescape(r.get('title', ''))} | {space} | {r.get('lastModified', '')[:10]} | {url}")
+    elif a == "update":
+        pid = page_id(args.page)
+        page = c.get(f"/wiki/api/v2/pages/{pid}", **{"body-format": "storage"})
+        version = page["version"]["number"]
+        if version != args.base_version:
+            sys.exit(f"The page is at version {version}, not {args.base_version}. Someone changed it. "
+                     "Read it again and merge the changes before you update it.")
+        new_body = read_file(args.file)
+        title = args.title or page["title"]
+        print(f"Update page {pid} '{page['title']}' from version {version} to {version + 1}:")
+        if title != page["title"]:
+            print(f"Title: {page['title']!r} -> {title!r}")
+        show_diff("Body", html_to_text(page["body"]["storage"]["value"]), html_to_text(new_body))
+        if confirm(args, "update the page"):
+            c.write("PUT", f"/wiki/api/v2/pages/{pid}", body={
+                "id": pid, "status": "current", "title": title,
+                "body": {"representation": "storage", "value": new_body},
+                "version": {"number": version + 1, "message": args.message or ""}})
+            print(f"Updated page {pid} to version {version + 1}.")
+    elif a == "comment":
+        pid = page_id(args.page)
+        body = read_file(args.file)
+        print(f"New footer comment on page {pid}:\n\n{html_to_text(body)}")
+        if confirm(args, "post the comment"):
+            r = c.write("POST", "/wiki/api/v2/footer-comments",
+                        body={"pageId": pid, "body": {"representation": "storage", "value": body}})
+            print(f"Posted comment {r.get('id')}.")
+
+
+# --- argument parsing ---------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(prog="atl", description="Atlassian CLI. Writes need --yes.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    a = sub.add_parser("auth")
+    a.add_argument("action", choices=["login", "set-token", "status", "logout"])
+    a.add_argument("app", nargs="?", help="jira, confluence, jira-write or confluence-write, for set-token")
+    a.set_defaults(func=cmd_auth)
+
+    j = sub.add_parser("jira").add_subparsers(dest="action", required=True)
+    g = j.add_parser("get"); g.add_argument("key"); g.add_argument("--fields"); g.add_argument("--comments", action="store_true"); g.add_argument("--json", action="store_true")
+    s = j.add_parser("search"); s.add_argument("jql"); s.add_argument("--fields"); s.add_argument("--max", type=int, default=50); s.add_argument("--json", action="store_true")
+    fd = j.add_parser("find"); fd.add_argument("text"); fd.add_argument("--project", help="Defaults to default_project in the config"); fd.add_argument("--open", action="store_true", help="Only tickets not Done")
+    fd.add_argument("--max", type=int, default=25); fd.add_argument("--fields", default="summary,status,assignee"); fd.add_argument("--json", action="store_true")
+    cm = j.add_parser("comments"); cm.add_argument("key"); cm.add_argument("--json", action="store_true")
+    j.add_parser("transitions").add_argument("key")
+    j.add_parser("editmeta").add_argument("key")
+    j.add_parser("user").add_argument("query")
+
+    def field_options(sp, create=False):
+        sp.add_argument("--summary", required=create)
+        sp.add_argument("--description-file")
+        sp.add_argument("--points", type=float)
+        sp.add_argument("--labels", help="Comma-separated. Replaces all labels.")
+        sp.add_argument("--parent")
+        sp.add_argument("--yes", action="store_true")
+        if not create:
+            sp.add_argument("--priority")
+            sp.add_argument("--assignee", help="Account id, me or none")
+            sp.add_argument("--sprint", type=int, help="Sprint id (atl jira get shows it)")
+            sp.add_argument("--set", action="append", metavar="FIELD=JSON", help="Any field, for example customfield_123=\"x\"")
+
+    e = j.add_parser("edit"); e.add_argument("key"); field_options(e)
+    cr = j.add_parser("create"); cr.add_argument("--project", required=True); cr.add_argument("--type", required=True); field_options(cr, create=True)
+    co = j.add_parser("comment"); co.add_argument("key"); co.add_argument("--file", required=True); co.add_argument("--yes", action="store_true")
+    ec = j.add_parser("edit-comment"); ec.add_argument("key"); ec.add_argument("comment_id"); ec.add_argument("--file", required=True); ec.add_argument("--yes", action="store_true")
+    t = j.add_parser("transition"); t.add_argument("key"); t.add_argument("transition"); t.add_argument("--yes", action="store_true")
+    for sp in j.choices.values():
+        sp.set_defaults(func=cmd_jira)
+
+    cf = sub.add_parser("confluence").add_subparsers(dest="action", required=True)
+    cg = cf.add_parser("get"); cg.add_argument("page"); cg.add_argument("--json", action="store_true")
+    cs = cf.add_parser("search"); cs.add_argument("cql"); cs.add_argument("--max", type=int, default=25); cs.add_argument("--json", action="store_true")
+    cfd = cf.add_parser("find"); cfd.add_argument("text"); cfd.add_argument("--space"); cfd.add_argument("--max", type=int, default=15); cfd.add_argument("--json", action="store_true")
+    cu = cf.add_parser("update"); cu.add_argument("page"); cu.add_argument("--file", required=True)
+    cu.add_argument("--base-version", type=int, required=True, help="The version you read. The update stops if the page changed.")
+    cu.add_argument("--title"); cu.add_argument("--message"); cu.add_argument("--yes", action="store_true")
+    cc = cf.add_parser("comment"); cc.add_argument("page"); cc.add_argument("--file", required=True); cc.add_argument("--yes", action="store_true")
+    for sp in cf.choices.values():
+        sp.set_defaults(func=cmd_confluence)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
